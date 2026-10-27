@@ -49,13 +49,21 @@ pub async fn interactive(
 
     let theme = style::stdout_theme(cli, config);
     if !cli.quiet {
+        // The budget is worth one line at startup: it is what decides whether a
+        // turn fits, and it is now often derived from the model rather than
+        // configured, so a user who never set one should still see it.
+        let budget = match state.context_budget {
+            Some(tokens) => format!(" · context {tokens}"),
+            None => String::new(),
+        };
         println!(
-            "{} {} · {} · {} · policy: {}",
+            "{} {} · {} · {} · policy: {}{}",
             theme.accent("imp"),
             env!("CARGO_PKG_VERSION"),
             theme.bold(&state.options.model),
             theme.dim(&state.workspace_root.display().to_string()),
             theme.bold(decision_name(config.policy.default)),
+            theme.dim(&budget),
         );
         println!(
             "{} {} · {}",
@@ -162,6 +170,10 @@ pub async fn interactive(
         let _ = rendering.await;
 
         // Persist what the turn added, including a partial turn after Ctrl-C.
+        // Compaction may have replaced messages *before* `reply_start`, so the
+        // index has to lose what it removed or the turn would be written twice:
+        // once from the shifted position, once from the old one.
+        let reply_start = reply_start.saturating_sub(outcome.compacted);
         if let Err(err) = state.persist_since(reply_start).await {
             eprintln!("imp: could not save the assistant reply: {err}");
         }
@@ -369,6 +381,118 @@ async fn handle_slash(
                 theme.bold(&usage.total_tokens.to_string()),
             );
         }
+        "context" => {
+            let schemas = state.tools.schemas();
+            let tools = imp_core::tokens::estimate_tools(&schemas);
+            let system = state
+                .history
+                .first()
+                .map(imp_core::tokens::estimate_message)
+                .unwrap_or(0);
+            let history = imp_core::tokens::estimate_messages(&state.history);
+            let used = history + tools;
+
+            let window = config
+                .provider
+                .context_window
+                .or_else(|| state.context.as_ref().and_then(|info| info.context_window));
+            match window {
+                Some(window) => {
+                    let source = match (&state.context, config.provider.context_window) {
+                        (_, Some(_)) => "configured".to_string(),
+                        (Some(info), None) => info.describe(),
+                        (None, None) => "not discovered".to_string(),
+                    };
+                    println!(
+                        "{} {} window  ({})",
+                        theme.dim("context"),
+                        theme.bold(&window.to_string()),
+                        theme.dim(&source),
+                    );
+                }
+                None => println!(
+                    "{}",
+                    theme.dim(
+                        "context: the endpoint reported no window — \
+                         set provider.context_window or agent.context_tokens"
+                    )
+                ),
+            }
+
+            println!(
+                "          {} fixed     (system {} + tools {})",
+                theme.info(&(system + tools).to_string()),
+                system,
+                tools
+            );
+            println!("          {} history", theme.info(&history.to_string()));
+
+            match state.context_budget {
+                Some(budget) => {
+                    let percent = (used as f32 / budget as f32 * 100.0).round() as u32;
+                    let threshold = (budget as f32 * state.options.compact_threshold) as usize;
+                    println!(
+                        "          {} used     {}% · compact at {}",
+                        theme.bold(&used.to_string()),
+                        percent,
+                        threshold
+                    );
+                    println!(
+                        "          {}",
+                        theme.dim(&format!(
+                            "budget {budget} · compact {} · keep {} turn(s)",
+                            if state.options.compact { "on" } else { "off" },
+                            state.options.compact_keep_turns,
+                        ))
+                    );
+                }
+                None => println!(
+                    "          {} used     no budget: nothing trims and nothing compacts",
+                    theme.bold(&used.to_string())
+                ),
+            }
+        }
+        "compact" => match argument {
+            Some("off") => {
+                state.options.compact = false;
+                println!(
+                    "{} {}",
+                    theme.success("compaction off:"),
+                    theme.dim("history is trimmed when it no longer fits")
+                );
+            }
+            Some("on") => {
+                state.options.compact = true;
+                println!(
+                    "{} {}",
+                    theme.success("compaction on:"),
+                    theme.dim(&format!(
+                        "at {}% of the budget, keeping the last {} turn(s)",
+                        (state.options.compact_threshold * 100.0).round() as u32,
+                        state.options.compact_keep_turns,
+                    ))
+                );
+            }
+            Some(other) => {
+                println!(
+                    "{}",
+                    theme.dim(&format!("compact: unknown option `{other}`; use on or off"))
+                );
+            }
+            None => match state.compact_now(true).await? {
+                Some((replaced, before, after)) => println!(
+                    "{} {} messages → one summary ({} → {} tokens)",
+                    theme.success("compacted:"),
+                    replaced,
+                    before,
+                    after
+                ),
+                None => println!(
+                    "{}",
+                    theme.dim("nothing to compact: no older turn worth replacing")
+                ),
+            },
+        },
         "session" => {
             println!("{}", theme.info(&state.session_id));
             println!(
@@ -460,6 +584,11 @@ fn print_help(theme: Theme) {
     row("/tools", "enabled tools, risk class and approval");
     row("/cron", "scheduled jobs (alias /jobs)");
     row("/cost", "token usage for this session");
+    row("/context", "the window, the budget and the fixed cost");
+    row(
+        "/compact [on|off]",
+        "summarize older turns now, or toggle it",
+    );
     row("/session", "the id sent to the provider as ${session}");
     row("/where", "the database path");
     head("Approval");

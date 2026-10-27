@@ -59,6 +59,15 @@ pub fn estimate_tools(tools: &[ToolSchema]) -> usize {
         .sum()
 }
 
+/// Estimate what one whole request costs: transcript plus the schemas beside it.
+///
+/// This is the number that decides whether a request fits, and the number
+/// `/context` reports, so both read it from here rather than adding the parts
+/// up in two places.
+pub fn estimate_request(messages: &[Message], tools: &[ToolSchema]) -> usize {
+    estimate_messages(messages) + estimate_tools(tools)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,11 +10,12 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::parse_tool_arguments;
+use crate::compact::{self, Summarizer, SummaryRole};
 use crate::error::{Error, Result};
 use crate::message::{FunctionCall, Message, Role, ToolCall};
 use crate::policy::ToolGate;
 use crate::provider::{ChatEvent, ChatRequest, FinishReason, Provider, ToolSchema, Usage};
-use crate::tokens::{estimate_message, estimate_messages, estimate_tools};
+use crate::tokens::{estimate_message, estimate_messages, estimate_request, estimate_tools};
 use crate::tool::{Risk, ToolCtx, ToolOutput, ToolRegistry};
 
 /// Why a turn ended.
@@ -59,6 +60,12 @@ pub struct TurnOutcome {
     pub usage: Usage,
     /// How many provider round-trips the turn took.
     pub iterations: u32,
+    /// Messages the turn's compaction removed from the in-memory history.
+    ///
+    /// The stored transcript keeps them: compaction is a view, and a caller
+    /// holding an index into `history` (the REPL persists from one) has to
+    /// shift it by this much.
+    pub compacted: usize,
 }
 
 /// Progress reported while a turn runs, for rendering and for the audit trail.
@@ -98,7 +105,7 @@ pub enum AgentEvent {
 }
 
 /// Immutable settings for a single [`Agent`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AgentOptions {
     /// Model identifier sent to the provider.
     pub model: String,
@@ -122,6 +129,17 @@ pub struct AgentOptions {
     pub context_tokens: Option<usize>,
     /// Largest number of characters of any one tool result sent to the model.
     pub tool_result_chars: Option<usize>,
+    /// Replace old turns with a generated summary when the context fills.
+    ///
+    /// Only has an effect with a [`Summarizer`] installed; without one the
+    /// loop trims, which is the behaviour that predates compaction.
+    pub compact: bool,
+    /// Fraction of `context_tokens` at which compaction runs.
+    pub compact_threshold: f32,
+    /// Most recent user turns a summary leaves untouched.
+    pub compact_keep_turns: usize,
+    /// Role a summary travels as, so a strict chat template can be satisfied.
+    pub summary_role: SummaryRole,
     /// Ask an empty reply for one more chance instead of ending the turn.
     pub nudge_on_empty: bool,
     /// Repair fenced or trailing-comma tool arguments before giving up.
@@ -130,12 +148,41 @@ pub struct AgentOptions {
     pub workspace_root: PathBuf,
 }
 
+impl Default for AgentOptions {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            max_iterations: 0,
+            temperature: None,
+            max_tokens: None,
+            parallel_tool_calls: None,
+            include_usage: false,
+            max_tool_calls_per_turn: 0,
+            context_tokens: None,
+            tool_result_chars: None,
+            compact: true,
+            compact_threshold: 0.8,
+            compact_keep_turns: 2,
+            summary_role: SummaryRole::System,
+            nudge_on_empty: false,
+            repair_arguments: false,
+            workspace_root: PathBuf::new(),
+        }
+    }
+}
+
 /// Drives a conversation against a [`Provider`] and a [`ToolRegistry`].
 pub struct Agent {
     provider: Arc<dyn Provider>,
     tools: Arc<ToolRegistry>,
     options: AgentOptions,
     gate: Option<Arc<dyn ToolGate>>,
+    /// Writes the summary that replaces history when the context fills.
+    ///
+    /// `None` is the pre-compaction behaviour: history is trimmed and the old
+    /// turns are gone. Injected the same way the gate is, so `imp-core` keeps
+    /// its promise not to know how the I/O happens.
+    summarizer: Option<Arc<dyn Summarizer>>,
     /// Conversation id, so an auditing gate can stamp the rows it writes.
     session_id: Option<String>,
 }
@@ -152,8 +199,18 @@ impl Agent {
             tools,
             options,
             gate: None,
+            summarizer: None,
             session_id: None,
         }
+    }
+
+    /// Install the summarizer compaction uses.
+    ///
+    /// Without one, a history that no longer fits is trimmed exactly as before:
+    /// compaction is an improvement, never a requirement.
+    pub fn with_summarizer(mut self, summarizer: Arc<dyn Summarizer>) -> Self {
+        self.summarizer = Some(summarizer);
+        self
     }
 
     /// Install the approval gate every tool call must pass.
@@ -202,6 +259,9 @@ impl Agent {
         let budget = self.options.max_tool_calls_per_turn;
         // Whether the one bounded nudge for an empty reply has been spent.
         let mut nudged = false;
+        // How many messages compaction has removed this turn, so the caller can
+        // shift any index it holds into `history`.
+        let mut compacted = 0usize;
 
         // One turn id per `run`, so every audit row this turn writes can be
         // grouped back to it. Generated before the loop so a cancelled turn
@@ -213,21 +273,44 @@ impl Agent {
 
         loop {
             if cancel.is_cancelled() {
-                return outcome(last_text, StopReason::Cancelled, usage, iterations);
+                return outcome(
+                    last_text,
+                    StopReason::Cancelled,
+                    usage,
+                    iterations,
+                    compacted,
+                );
             }
             if iterations >= self.options.max_iterations {
-                return outcome(last_text, StopReason::IterationLimit, usage, iterations);
+                return outcome(
+                    last_text,
+                    StopReason::IterationLimit,
+                    usage,
+                    iterations,
+                    compacted,
+                );
             }
             iterations += 1;
 
             // The catalogue is read live, so the schemas are fetched once per
             // iteration and reused for both budgeting and the request.
             let schemas = self.tools.schemas();
-            if let Some(context) = self.options.context_tokens
-                && let Some(message) = self.fit_context(history, &schemas, context)
-            {
-                let _ = sink.send(AgentEvent::Failed(message));
-                return outcome(last_text, StopReason::ProviderError, usage, iterations);
+            if let Some(context) = self.options.context_tokens {
+                // Proactive compaction first: a summary is cheaper to lose than
+                // a turn, and it keeps the decisions trimming would discard.
+                compacted += self
+                    .compact_if_needed(history, &schemas, context, sink, &cancel)
+                    .await;
+                if let Some(message) = self.fit_context(history, &schemas, context) {
+                    let _ = sink.send(AgentEvent::Failed(message));
+                    return outcome(
+                        last_text,
+                        StopReason::ProviderError,
+                        usage,
+                        iterations,
+                        compacted,
+                    );
+                }
             }
 
             let request = ChatRequest {
@@ -278,10 +361,22 @@ impl Agent {
 
             if let Some(err) = failure {
                 let _ = sink.send(AgentEvent::Failed(err));
-                return outcome(last_text, StopReason::ProviderError, usage, iterations);
+                return outcome(
+                    last_text,
+                    StopReason::ProviderError,
+                    usage,
+                    iterations,
+                    compacted,
+                );
             }
             if cancel.is_cancelled() {
-                return outcome(last_text, StopReason::Cancelled, usage, iterations);
+                return outcome(
+                    last_text,
+                    StopReason::Cancelled,
+                    usage,
+                    iterations,
+                    compacted,
+                );
             }
 
             if calls.is_empty() {
@@ -302,7 +397,13 @@ impl Agent {
                     last_text = Some(text.clone());
                 }
                 history.push(Message::assistant(text));
-                return outcome(last_text, StopReason::Completed, usage, iterations);
+                return outcome(
+                    last_text,
+                    StopReason::Completed,
+                    usage,
+                    iterations,
+                    compacted,
+                );
             }
 
             // A turn cut off by the token limit stopped part-way through a tool
@@ -428,7 +529,13 @@ impl Agent {
             if exhausted {
                 let _ = sink.send(AgentEvent::Notice(BUDGET_EXHAUSTED.to_string()));
                 history.push(Message::system(BUDGET_EXHAUSTED));
-                return outcome(last_text, StopReason::ToolBudget, usage, iterations);
+                return outcome(
+                    last_text,
+                    StopReason::ToolBudget,
+                    usage,
+                    iterations,
+                    compacted,
+                );
             }
         }
     }
@@ -490,6 +597,87 @@ impl Agent {
         result
     }
 
+    /// Replace old turns with a summary when the request nears its budget.
+    ///
+    /// Runs before the hard limit rather than at it: compaction costs a provider
+    /// round-trip of its own, and a summary that starts only once the request
+    /// would be rejected has no room to be written. Everything here is best
+    /// effort — a summarizer that fails, or a history with nothing but the
+    /// newest turn left, leaves the history alone and `fit_context` trims.
+    async fn compact_if_needed(
+        &self,
+        history: &mut Vec<Message>,
+        schemas: &[ToolSchema],
+        budget: usize,
+        sink: &UnboundedSender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> usize {
+        if !self.options.compact {
+            return 0;
+        }
+        let Some(summarizer) = &self.summarizer else {
+            return 0;
+        };
+        let threshold = (budget as f32 * self.options.compact_threshold) as usize;
+        if estimate_request(history, schemas) <= threshold {
+            return 0;
+        }
+
+        // The threshold has already decided that compaction is worth it, which
+        // is *before* the request would be rejected: compaction costs a
+        // round-trip and needs room to write its summary. `plan_forced` is what
+        // expresses "the caller decided"; `plan` would re-test the budget.
+        let Some(plan) = compact::plan_forced(history, self.options.compact_keep_turns) else {
+            return 0;
+        };
+        // Summarizing a couple of short messages costs more than it saves: the
+        // summary has a fixed preamble, so below this floor the trade is
+        // guaranteed to lose and the request is not worth making.
+        let replaced_tokens = estimate_messages(&history[plan.from..plan.to]);
+        if replaced_tokens < MIN_COMPACT_TOKENS {
+            return 0;
+        }
+        // Replacing one message means replacing the previous summary with a new
+        // summary of itself. That is a call per iteration for no gain, so it is
+        // refused outright: compaction must absorb at least one real message.
+        if plan.len() < 2 {
+            return 0;
+        }
+        let before = estimate_messages(history);
+        let replaced = plan.len();
+
+        match summarizer
+            .summarize(&history[plan.from..plan.to], cancel.clone())
+            .await
+        {
+            Ok(summary) => {
+                let message = compact::summary_message(self.options.summary_role, &summary);
+                // A summary that costs more than the messages it replaces has
+                // defeated the point. Keep the history as it was and let the
+                // trim decide; this is not worth telling the user about.
+                if estimate_message(&message) >= replaced_tokens {
+                    return 0;
+                }
+                history.splice(plan.from..plan.to, [message]);
+                let _ = sink.send(AgentEvent::Notice(format!(
+                    "compacted {replaced} messages into one summary ({before} → {} tokens)",
+                    estimate_messages(history)
+                )));
+                // One summary replaces `replaced`, so the net change is the
+                // difference: that is what an index has to lose.
+                replaced - 1
+            }
+            Err(err) => {
+                // The turn is not worth failing over a summary: say what
+                // happened and let the ordinary trim take over.
+                let _ = sink.send(AgentEvent::Notice(format!(
+                    "could not compact the conversation ({err}); older turns will be dropped"
+                )));
+                0
+            }
+        }
+    }
+
     /// Keep `history` within `budget` tokens, reserving room for the schemas.
     ///
     /// Returns a message when the system prompt and the tool schemas alone
@@ -523,10 +711,13 @@ const TRUNCATED_REPLY: &str = "the model hit its output limit; the reply may be 
 
 /// Drop the oldest whole turns until `history` fits `budget` tokens.
 ///
-/// Index 0 (the system prompt) is always kept, and the cut lands on a `user`
-/// message so an assistant `tool_calls` message is never separated from the
-/// results that answer it. The same invariant as the message-count window, but
-/// measured in tokens, which is what a small context actually cares about.
+/// Index 0 (the system prompt) is always kept, and so is a compaction summary at
+/// index 1: it is the *result* of dropping turns, so discarding it first would
+/// throw away the only record of what the dropped turns said. After that the cut
+/// lands on a `user` message so an assistant `tool_calls` message is never
+/// separated from the results that answer it — the same invariant as the
+/// message-count window, but measured in tokens, which is what a small context
+/// actually cares about.
 pub fn trim_to_budget(history: &mut Vec<Message>, budget: usize) {
     if history.len() <= 1 {
         return;
@@ -535,20 +726,31 @@ pub fn trim_to_budget(history: &mut Vec<Message>, budget: usize) {
         if estimate_messages(history) <= budget {
             return;
         }
-        // The next `user` message at or beyond index 2 begins the second turn,
-        // so messages [1..cut) are the oldest complete turn.
-        let next_user = history[1..]
+        // A summary at index 1 stands in for everything that was already
+        // dropped, so it survives the pass that follows.
+        let protect = if history.get(1).is_some_and(compact::is_summary) {
+            2
+        } else {
+            1
+        };
+        // The oldest complete turn runs from `protect` to the *next* user
+        // message; the first user message begins the turn being kept.
+        let first = history[protect..]
             .iter()
-            .enumerate()
-            .skip(1)
-            .find(|(_, message)| message.role == Role::User)
-            .map(|(offset, _)| offset + 1);
-        match next_user {
-            Some(cut) => {
-                history.drain(1..cut);
+            .position(|message| message.role == Role::User)
+            .map(|offset| offset + protect);
+        let cut = first.and_then(|first| {
+            history[first + 1..]
+                .iter()
+                .position(|message| message.role == Role::User)
+                .map(|offset| offset + first + 1)
+        });
+        match cut {
+            Some(cut) if cut > protect => {
+                history.drain(protect..cut);
             }
             // Only the newest turn is left; trimming further would orphan it.
-            None => return,
+            _ => return,
         }
     }
 }
@@ -564,12 +766,19 @@ fn cap_output(output: &mut ToolOutput, cap: usize) {
     output.truncated = true;
 }
 
-fn outcome(text: Option<String>, stop: StopReason, usage: Usage, iterations: u32) -> TurnOutcome {
+fn outcome(
+    text: Option<String>,
+    stop: StopReason,
+    usage: Usage,
+    iterations: u32,
+    compacted: usize,
+) -> TurnOutcome {
     TurnOutcome {
         text,
         stop,
         usage,
         iterations,
+        compacted,
     }
 }
 
@@ -621,6 +830,13 @@ const BUDGET_EXHAUSTED_SUMMARY: &str = "tool-call budget exhausted; not run";
 
 /// Prefix on the summary of a call answered from the turn's repeat cache.
 const REPEAT_SUMMARY: &str = "repeat, reused:";
+
+/// Smallest replaced range worth summarizing.
+///
+/// A summary carries a fixed instruction overhead, so replacing a few short
+/// messages with one always loses: the caller would pay a provider round-trip
+/// to make the context bigger. ~400 tokens is roughly one tool result.
+const MIN_COMPACT_TOKENS: usize = 400;
 
 /// A cache key that treats two calls with the same arguments as one.
 ///
@@ -1645,5 +1861,253 @@ mod tests {
 
         let result = history[2].content.clone().unwrap_or_default();
         assert!(result.contains("echo"), "unexpected result: {result}");
+    }
+
+    /// A summarizer that answers with fixed prose and counts its calls.
+    struct FakeSummarizer {
+        calls: Arc<AtomicUsize>,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl Summarizer for FakeSummarizer {
+        async fn summarize(
+            &self,
+            _messages: &[Message],
+            _cancel: CancellationToken,
+        ) -> Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(Error::Provider("the summarizer is down".to_string()));
+            }
+            Ok("they read AGENTS.md and it described the milestones".to_string())
+        }
+    }
+
+    /// A history long enough to cross a small budget: `turns` complete turns.
+    fn long_history(turns: usize) -> Vec<Message> {
+        let mut history = vec![Message::system("prompt")];
+        for index in 0..turns {
+            history.push(Message::user(format!(
+                "question {index} {}",
+                "x".repeat(500)
+            )));
+            history.push(Message::assistant("answer"));
+        }
+        history
+    }
+
+    fn compacting_agent(
+        provider: MockProvider,
+        summarizer: Arc<dyn Summarizer>,
+        compact: bool,
+    ) -> Agent {
+        Agent::new(
+            Arc::new(provider),
+            Arc::new(ToolRegistry::new()),
+            AgentOptions {
+                model: "mock".to_string(),
+                max_iterations: 4,
+                context_tokens: Some(600),
+                compact,
+                compact_threshold: 0.8,
+                compact_keep_turns: 2,
+                ..AgentOptions::default()
+            },
+        )
+        .with_summarizer(summarizer)
+    }
+
+    fn text_reply() -> Script {
+        Script::Events(vec![
+            ChatEvent::TextDelta("done".to_string()),
+            ChatEvent::Done {
+                finish_reason: FinishReason::Stop,
+            },
+        ])
+    }
+
+    /// Compaction is the point of the feature: the old turns become prose the
+    /// model can still act on, instead of vanishing.
+    #[tokio::test]
+    async fn a_history_near_the_budget_is_compacted_into_one_summary() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = compacting_agent(
+            MockProvider::new(vec![text_reply()]),
+            Arc::new(FakeSummarizer {
+                calls: calls.clone(),
+                fail: false,
+            }),
+            true,
+        );
+        let mut history = long_history(6);
+        let before_len = history.len();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = agent
+            .run(&mut history, &sender, CancellationToken::new())
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "one summary per turn");
+        // The contract the caller's persistence depends on: an index captured
+        // before the turn moves down by exactly `compacted`, while the turn's
+        // own messages still append normally.
+        assert_eq!(history.len(), before_len + 1 - outcome.compacted);
+        assert_eq!(history[0].role, Role::System);
+        assert_eq!(history[0].content.as_deref(), Some("prompt"));
+        assert!(
+            compact::is_summary(&history[1]),
+            "the second message should be the summary: {history:?}"
+        );
+        assert!(
+            history[1].content.as_deref().unwrap().contains("AGENTS.md"),
+            "the summarizer's own prose must be what stands in"
+        );
+        assert_eq!(
+            outcome.compacted, 7,
+            "eight messages replaced by one; the caller needs the net count"
+        );
+        let last_user = history
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .expect("the newest user turn survives");
+        assert!(
+            last_user
+                .content
+                .as_deref()
+                .unwrap()
+                .starts_with("question 5"),
+            "the newest turn is kept verbatim: {:?}",
+            last_user.content
+        );
+        // The invariant that makes the transcript valid.
+        let kept_users = history
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .count();
+        assert!(kept_users >= 2, "the kept turns survived: {history:?}");
+    }
+
+    /// Compaction is best effort: a provider that will not summarize must not
+    /// cost the turn. Trimming still runs.
+    #[tokio::test]
+    async fn a_failed_summary_falls_back_to_trimming() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = compacting_agent(
+            MockProvider::new(vec![text_reply()]),
+            Arc::new(FakeSummarizer {
+                calls: calls.clone(),
+                fail: true,
+            }),
+            true,
+        );
+        let mut history = long_history(6);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = agent
+            .run(&mut history, &sender, CancellationToken::new())
+            .await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "it did try");
+        assert_eq!(outcome.compacted, 0, "nothing was replaced");
+        assert!(
+            !history.iter().any(compact::is_summary),
+            "a failed summary leaves no marker: {history:?}"
+        );
+        assert_eq!(outcome.stop, StopReason::Completed);
+        assert_eq!(history[0].content.as_deref(), Some("prompt"));
+    }
+
+    /// `compact = false` is the pre-compaction behaviour, exactly.
+    #[tokio::test]
+    async fn compaction_can_be_turned_off() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let agent = compacting_agent(
+            MockProvider::new(vec![text_reply()]),
+            Arc::new(FakeSummarizer {
+                calls: calls.clone(),
+                fail: false,
+            }),
+            false,
+        );
+        let mut history = long_history(6);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = agent
+            .run(&mut history, &sender, CancellationToken::new())
+            .await;
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the summarizer is not asked"
+        );
+        assert_eq!(outcome.compacted, 0);
+        assert!(!history.iter().any(compact::is_summary));
+    }
+
+    /// A summarizer whose answer is longer than what it replaces.
+    struct VerboseSummarizer;
+
+    #[async_trait]
+    impl Summarizer for VerboseSummarizer {
+        async fn summarize(
+            &self,
+            messages: &[Message],
+            _cancel: CancellationToken,
+        ) -> Result<String> {
+            let before = estimate_messages(messages);
+            Ok("y".repeat(before * 8))
+        }
+    }
+
+    /// Compaction that makes the context bigger is refused, not applied.
+    #[tokio::test]
+    async fn a_summary_larger_than_what_it_replaces_is_not_applied() {
+        let agent = compacting_agent(
+            MockProvider::new(vec![text_reply()]),
+            Arc::new(VerboseSummarizer),
+            true,
+        );
+        let mut history = long_history(6);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        let outcome = agent
+            .run(&mut history, &sender, CancellationToken::new())
+            .await;
+
+        assert_eq!(outcome.compacted, 0);
+        assert!(
+            !history.iter().any(compact::is_summary),
+            "a losing summary must not be spliced in: {history:?}"
+        );
+        assert_eq!(outcome.stop, StopReason::Completed);
+    }
+
+    /// Trimming must not eat the summary: it sits exactly where trimming starts
+    /// dropping, and losing it would lose the only record of the dropped turns.
+    #[test]
+    fn trimming_keeps_the_summary_it_stands_behind() {
+        let mut history = vec![
+            Message::system("prompt"),
+            compact::summary_message(SummaryRole::System, "everything before this"),
+            Message::user("old question"),
+            Message::assistant("old answer"),
+            Message::user("new question"),
+            Message::assistant("new answer"),
+        ];
+        trim_to_budget(&mut history, 1);
+
+        assert_eq!(history[0].content.as_deref(), Some("prompt"));
+        assert!(
+            compact::is_summary(&history[1]),
+            "the summary survived trimming: {history:?}"
+        );
+        assert_eq!(
+            history[2].content.as_deref(),
+            Some("new question"),
+            "the oldest kept turn went, not the summary"
+        );
     }
 }

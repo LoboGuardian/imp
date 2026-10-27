@@ -103,6 +103,23 @@ pub struct Config {
     pub ui: UiConfig,
 }
 
+/// How `imp` learns the model's context window.
+///
+/// The OpenAI-compatible API does not publish it, but every local backend
+/// publishes it somewhere. Discovery is opportunistic and never fails a
+/// session: an endpoint that answers nothing leaves the budget unset, which is
+/// the behaviour of a version that had no probe at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextProbe {
+    /// Ask the endpoint. The origin-level endpoints (`/props`, `/api/ps`,
+    /// `/api/v0/models`) are only tried for a loopback address.
+    #[default]
+    Auto,
+    /// Never ask; use `provider.context_window` alone.
+    Off,
+}
+
 /// Settings for the OpenAI-compatible endpoint.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -140,6 +157,15 @@ pub struct ProviderConfig {
     pub extra_body: serde_json::Map<String, serde_json::Value>,
     /// Backend compatibility switches.
     pub quirks: ProviderQuirks,
+    /// Context window of the model, when the operator knows it.
+    ///
+    /// Set this and nothing is probed: an explicit number always wins. Leave it
+    /// unset and `imp` asks the endpoint, which is where a local model's real
+    /// window lives.
+    pub context_window: Option<usize>,
+    /// How to learn the window when [`context_window`](Self::context_window) is
+    /// unset.
+    pub context_probe: ContextProbe,
     /// Ask the backend to constrain tool arguments to their JSON schema.
     ///
     /// A provider quirk, off by default. When the backend understands it
@@ -177,6 +203,8 @@ impl Default for ProviderConfig {
             stream_idle_timeout_secs: 120,
             extra_body: serde_json::Map::new(),
             quirks: ProviderQuirks::default(),
+            context_window: None,
+            context_probe: ContextProbe::default(),
             strict_tool_arguments: false,
             headers: BTreeMap::new(),
         }
@@ -196,6 +224,12 @@ pub struct ProviderQuirks {
     /// Serialize `"content": null` on assistant tool-call messages instead of
     /// omitting the field, for templates that require it.
     pub empty_assistant_content: bool,
+    /// Carry a compaction summary as a `user` message rather than `system`.
+    ///
+    /// A summary is context, so `system` is the honest role and the default.
+    /// Some chat templates accept only one system message, at the start; this
+    /// switch is for those backends.
+    pub summary_as_user: bool,
 }
 
 impl Default for ProviderQuirks {
@@ -205,6 +239,7 @@ impl Default for ProviderQuirks {
             omit_parallel_tool_calls: false,
             omit_tool_choice: false,
             empty_assistant_content: false,
+            summary_as_user: false,
         }
     }
 }
@@ -229,21 +264,36 @@ pub struct AgentSettings {
     /// system prompt. A 2–4B model imitates "never/always" far better than a
     /// vague instruction, so the rules are imperative and finite.
     pub small_model: bool,
-    /// Advisory token ceiling for a turn.
-    pub max_tokens_per_turn: u64,
     /// How many trailing messages to send.
     pub history_window: usize,
-    /// Summarize dropped history instead of discarding it silently.
-    pub summarize_on_truncate: bool,
-    /// Token budget for the whole request. `None` disables token trimming.
+    /// Token budget for the whole request. `None` derives one from the model's
+    /// discovered context window, and disables trimming when that is unknown.
     ///
     /// Covers the system prompt, history and reserved room for the tool
-    /// schemas. This is what keeps a small-context model from overflowing.
+    /// schemas. Enforced before every provider call, because tool results
+    /// accumulate between iterations.
     pub context_tokens: Option<usize>,
     /// Largest number of characters of any one tool result sent to the model.
     ///
     /// `None` leaves results uncapped.
     pub tool_result_chars: Option<usize>,
+    /// Replace old turns with one generated summary when the context fills.
+    ///
+    /// This is what `/compact` forces; `false` leaves trimming as the only
+    /// defence, exactly as before the feature existed.
+    pub compact: bool,
+    /// Fraction of the budget at which compaction runs, `0.1..=1.0`.
+    ///
+    /// Compaction is proactive: it starts *before* the request would be
+    /// rejected, because a summarizer needs room to answer.
+    pub compact_threshold: f32,
+    /// Most recent user turns kept verbatim when a summary is made.
+    pub compact_keep_turns: usize,
+    /// Model used to write summaries. `None` uses the session's model.
+    ///
+    /// On a local backend a different model is a different load, which can
+    /// evict the one being used; this is a convenience for hosted providers.
+    pub compact_model: Option<String>,
     /// Upper bound on tokens generated per provider response. `None` sends none.
     pub max_tokens: Option<u32>,
     /// Give an empty model reply one bounded second chance.
@@ -259,11 +309,13 @@ impl Default for AgentSettings {
             max_iterations: 25,
             max_tool_calls_per_turn: 0,
             small_model: false,
-            max_tokens_per_turn: 200_000,
             history_window: 40,
-            summarize_on_truncate: true,
             context_tokens: None,
             tool_result_chars: None,
+            compact: true,
+            compact_threshold: 0.8,
+            compact_keep_turns: 2,
+            compact_model: None,
             max_tokens: None,
             nudge_on_empty: false,
             repair_arguments: true,
@@ -1181,6 +1233,21 @@ impl Config {
                 "agent.max_iterations must be at least 1".to_string(),
             ));
         }
+        if !(0.1..=1.0).contains(&self.agent.compact_threshold) {
+            return Err(Error::Config(
+                "agent.compact_threshold must be between 0.1 and 1.0".to_string(),
+            ));
+        }
+        if self.agent.compact_keep_turns == 0 {
+            return Err(Error::Config(
+                "agent.compact_keep_turns must be at least 1".to_string(),
+            ));
+        }
+        if self.provider.context_window == Some(0) {
+            return Err(Error::Config(
+                "provider.context_window must be greater than zero".to_string(),
+            ));
+        }
         if self.workspace.roots.is_empty() {
             return Err(Error::Config(
                 "workspace.roots must list at least one root".to_string(),
@@ -1879,6 +1946,104 @@ mod tests {
         assert!(config.agent.small_model);
         assert_eq!(config.agent.max_tool_calls_per_turn, 12);
         assert!(config.provider.strict_tool_arguments);
+    }
+
+    #[test]
+    fn the_context_window_and_its_probe_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("imp.toml"),
+            "[provider]\ncontext_window = 32768\ncontext_probe = \"off\"\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert_eq!(config.provider.context_window, Some(32_768));
+        assert_eq!(config.provider.context_probe, ContextProbe::Off);
+    }
+
+    #[test]
+    fn discovery_is_the_default_way_to_learn_the_window() {
+        let config = Config::default();
+        assert_eq!(config.provider.context_probe, ContextProbe::Auto);
+        assert_eq!(config.provider.context_window, None);
+    }
+
+    #[test]
+    fn compaction_settings_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("imp.toml"),
+            "[agent]\ncompact = false\ncompact_threshold = 0.5\n\
+             compact_keep_turns = 4\ncompact_model = \"tiny/summarizer\"\n\
+             \n[provider.quirks]\nsummary_as_user = true\n",
+        );
+
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+
+        assert!(!config.agent.compact);
+        assert_eq!(config.agent.compact_threshold, 0.5);
+        assert_eq!(config.agent.compact_keep_turns, 4);
+        assert_eq!(
+            config.agent.compact_model.as_deref(),
+            Some("tiny/summarizer")
+        );
+        assert!(config.provider.quirks.summary_as_user);
+    }
+
+    #[test]
+    fn compaction_defaults_are_on_and_conservative() {
+        let agent = AgentSettings::default();
+        assert!(agent.compact, "a small context needs this on by default");
+        assert_eq!(agent.compact_threshold, 0.8);
+        assert_eq!(agent.compact_keep_turns, 2);
+        assert_eq!(agent.compact_model, None, "the session's model by default");
+    }
+
+    #[test]
+    fn a_threshold_outside_its_range_is_rejected() {
+        for threshold in ["0.0", "1.5", "-0.2"] {
+            let dir = tempfile::tempdir().unwrap();
+            write(
+                &dir.path().join("imp.toml"),
+                &format!("[agent]\ncompact_threshold = {threshold}\n"),
+            );
+            let result = Config::load_with(None, None, dir.path());
+            assert!(result.is_err(), "threshold {threshold} should be rejected");
+        }
+    }
+
+    #[test]
+    fn keeping_no_turn_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("imp.toml"),
+            "[agent]\ncompact_keep_turns = 0\n",
+        );
+        assert!(Config::load_with(None, None, dir.path()).is_err());
+    }
+
+    #[test]
+    fn a_zero_context_window_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("imp.toml"),
+            "[provider]\ncontext_window = 0\n",
+        );
+        assert!(Config::load_with(None, None, dir.path()).is_err());
+    }
+
+    #[test]
+    fn the_retired_summarize_key_is_ignored_rather_than_fatal() {
+        // Forward compatibility: a config written before compaction existed
+        // still loads, and the key simply has no effect.
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            &dir.path().join("imp.toml"),
+            "[agent]\nsummarize_on_truncate = true\nmax_tokens_per_turn = 5\n",
+        );
+        let config = Config::load_with(None, None, dir.path()).unwrap();
+        assert!(config.agent.compact);
     }
 
     #[test]

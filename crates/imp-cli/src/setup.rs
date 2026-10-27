@@ -9,7 +9,8 @@ use async_trait::async_trait;
 
 use imp_core::agent::{Agent, AgentEvent, AgentOptions, StopReason};
 use imp_core::clock::SystemClock;
-use imp_core::config::{Config, Decision};
+use imp_core::compact::{Summarizer, SummaryRole};
+use imp_core::config::{Config, ContextProbe, Decision};
 use imp_core::error::{Error, Result};
 use imp_core::guard::GuardThresholds;
 use imp_core::job::{Job, SessionMode};
@@ -22,7 +23,7 @@ use imp_core::tool::ToolRegistry;
 use imp_cron::RunReport;
 use imp_guard::HttpSystemOneGuard;
 use imp_mcp::{McpServers, OnStart, PeerAsk, peer_policies, peer_tools};
-use imp_provider::OpenAiProvider;
+use imp_provider::{ModelInfo, OpenAiProvider};
 use imp_store::{NewSession, SessionRow, Store};
 use imp_tools::{CronContext, ToolConfig, default_registry};
 use tokio::sync::mpsc;
@@ -31,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 use crate::approval;
 use crate::cli::Cli;
 use crate::style::Theme;
+use crate::summarize::ProviderSummarizer;
 
 /// Everything one interactive or one-shot run needs.
 pub struct Session {
@@ -54,6 +56,12 @@ pub struct Session {
     /// Runs a scheduled job's prompt. Wired to the real agent, always
     /// non-interactively; the scheduler never builds an agent itself.
     pub cron_runner: Arc<dyn imp_cron::JobRunner>,
+    /// What the backend reported about the model, for `/context` and `doctor`.
+    pub context: Option<ModelInfo>,
+    /// Token budget the loop actually enforces, after discovery.
+    pub context_budget: Option<usize>,
+    /// Model that writes compaction summaries; the session's unless configured.
+    summary_model: String,
     /// Retained so the provider can be rebuilt when the conversation changes.
     spec: ProviderSpec,
     /// The approval gate, shared so session-scoped allows accumulate.
@@ -117,6 +125,19 @@ impl Session {
         )
         .with_gate(self.gate.clone())
         .with_session(self.session_id.clone())
+        .with_summarizer(self.summarizer())
+    }
+
+    /// The summarizer compaction uses, built from the *current* provider.
+    ///
+    /// Rebuilt per agent rather than stored, so `adopt` — which changes the
+    /// conversation and therefore the `${session}` header — cannot leave a
+    /// summarizer talking through the previous conversation's client.
+    fn summarizer(&self) -> Arc<dyn Summarizer> {
+        Arc::new(ProviderSummarizer::new(
+            self.provider.clone(),
+            self.summary_model.clone(),
+        ))
     }
 
     /// Point this session at a different conversation.
@@ -207,6 +228,49 @@ impl Session {
         .with_session_id(self.session_id.clone())
         .list_models()
         .await
+    }
+
+    /// Replace the oldest turns with a summary, on demand.
+    ///
+    /// Returns `(messages replaced, tokens before, tokens after)` when something
+    /// was compacted, and `None` when there was nothing to replace. `force` is
+    /// `/compact`: it ignores the threshold, because the user asked, but the
+    /// same boundaries apply — the prompt survives and no turn is split.
+    ///
+    /// Only the in-memory history changes. The stored transcript keeps every
+    /// message (R3), so a resume sees the whole conversation and compacts again
+    /// if it needs to.
+    pub async fn compact_now(&mut self, force: bool) -> Result<Option<(usize, usize, usize)>> {
+        let keep = self.options.compact_keep_turns;
+        let plan = match (self.context_budget, force) {
+            (Some(budget), false) => {
+                let tools = imp_core::tokens::estimate_tools(&self.tools.schemas());
+                imp_core::compact::plan(&self.history, budget.saturating_sub(tools), keep)
+            }
+            (_, true) => imp_core::compact::plan_forced(&self.history, keep),
+            (None, false) => None,
+        };
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+
+        let before = imp_core::tokens::estimate_messages(&self.history);
+        let replaced = plan.len();
+        let replaced_tokens =
+            imp_core::tokens::estimate_messages(&self.history[plan.from..plan.to]);
+        let summary = self
+            .summarizer()
+            .summarize(&self.history[plan.from..plan.to], CancellationToken::new())
+            .await?;
+        let message = imp_core::compact::summary_message(self.options.summary_role, &summary);
+        // Asking for a summary that costs more than what it replaces would make
+        // the context worse, so a forced compaction refuses it too.
+        if imp_core::tokens::estimate_message(&message) >= replaced_tokens {
+            return Ok(None);
+        }
+        self.history.splice(plan.from..plan.to, [message]);
+        let after = imp_core::tokens::estimate_messages(&self.history);
+        Ok(Some((replaced, before, after)))
     }
 
     /// The text of the first user message, used to derive a title.
@@ -323,6 +387,17 @@ pub async fn build(
         "session ready"
     );
 
+    // What the model can actually hold. An explicit `context_window` skips the
+    // probe; otherwise the endpoint is asked, and an endpoint that answers
+    // nothing leaves the budget unset — which is exactly the behaviour of the
+    // version that had no probe at all.
+    let context = match config.provider.context_probe {
+        ContextProbe::Off => None,
+        ContextProbe::Auto if config.provider.context_window.is_some() => None,
+        ContextProbe::Auto => provider.probe_context(&config.provider.model).await,
+    };
+    let context_budget = effective_budget(config, context.as_ref());
+
     let options = AgentOptions {
         model: config.provider.model.clone(),
         max_iterations: config.agent.max_iterations,
@@ -331,8 +406,12 @@ pub async fn build(
         parallel_tool_calls: Some(config.provider.parallel_tool_calls),
         include_usage: config.provider.supports_usage_in_stream,
         max_tool_calls_per_turn: config.agent.max_tool_calls_per_turn,
-        context_tokens: config.agent.context_tokens,
+        context_tokens: context_budget,
         tool_result_chars: config.agent.tool_result_chars,
+        compact: config.agent.compact,
+        compact_threshold: config.agent.compact_threshold,
+        compact_keep_turns: config.agent.compact_keep_turns,
+        summary_role: summary_role(config),
         nudge_on_empty: config.agent.nudge_on_empty,
         repair_arguments: config.agent.repair_arguments,
         workspace_root: workspace_root.clone(),
@@ -398,6 +477,9 @@ pub async fn build(
         store,
         history_window,
         cron_runner,
+        context,
+        context_budget,
+        summary_model: summary_model(config),
         spec,
         gate,
         auto,
@@ -431,6 +513,59 @@ pub(crate) fn tool_config(config: &Config) -> ToolConfig {
     }
 }
 
+/// Generation room reserved when a budget is derived from a discovered window.
+///
+/// A model can overflow *while producing* its answer, not only on the prompt: a
+/// reasoning model spends its window before it emits a token of text. Reserving
+/// only for the prompt leaves that failure open, which is how a turn can die
+/// with an empty reply on a cold local model.
+const DEFAULT_GENERATION_RESERVE: usize = 512;
+
+/// The token budget the loop should enforce.
+///
+/// Precedence: an explicit `agent.context_tokens` wins, then the window
+/// discovered from the endpoint, then `provider.context_window`. The reserve is
+/// generation room plus a 5% margin for the tokenizer's own framing, which the
+/// character heuristic does not model.
+pub(crate) fn effective_budget(config: &Config, context: Option<&ModelInfo>) -> Option<usize> {
+    if let Some(tokens) = config.agent.context_tokens {
+        return Some(tokens);
+    }
+    let window = config
+        .provider
+        .context_window
+        .or_else(|| context.and_then(|info| info.context_window))?;
+    let generation = config
+        .agent
+        .max_tokens
+        .map(|tokens| tokens as usize)
+        .unwrap_or(0)
+        .max(DEFAULT_GENERATION_RESERVE);
+    Some(
+        window
+            .saturating_sub(generation)
+            .saturating_sub(window / 20)
+            .max(1),
+    )
+}
+
+/// Model that writes compaction summaries.
+pub(crate) fn summary_model(config: &Config) -> String {
+    config
+        .agent
+        .compact_model
+        .clone()
+        .unwrap_or_else(|| config.provider.model.clone())
+}
+
+/// Role a summary travels as, honouring the strict-template quirk.
+pub(crate) fn summary_role(config: &Config) -> SummaryRole {
+    if config.provider.quirks.summary_as_user {
+        SummaryRole::User
+    } else {
+        SummaryRole::System
+    }
+}
 /// What the `cron_*` tools need from the process: a clock, and the default zone.
 pub(crate) fn cron_context(config: &Config) -> CronContext {
     CronContext {
@@ -646,19 +781,24 @@ impl JobAgentRunner {
             parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
             include_usage: self.config.provider.supports_usage_in_stream,
             max_tool_calls_per_turn: self.config.agent.max_tool_calls_per_turn,
-            context_tokens: self.config.agent.context_tokens,
+            context_tokens: effective_budget(&self.config, None),
             tool_result_chars: self.config.agent.tool_result_chars,
+            compact: self.config.agent.compact,
+            compact_threshold: self.config.agent.compact_threshold,
+            compact_keep_turns: self.config.agent.compact_keep_turns,
+            summary_role: summary_role(&self.config),
             nudge_on_empty: self.config.agent.nudge_on_empty,
             repair_arguments: self.config.agent.repair_arguments,
             workspace_root: workspace,
         };
-        let agent = Agent::new(
-            Arc::new(self.spec.build(&session_id)),
-            self.tools.clone(),
-            options,
-        )
-        .with_gate(self.gate.clone())
-        .with_session(session_id.clone());
+        let provider: Arc<dyn Provider> = Arc::new(self.spec.build(&session_id));
+        let agent = Agent::new(provider.clone(), self.tools.clone(), options)
+            .with_gate(self.gate.clone())
+            .with_session(session_id.clone())
+            .with_summarizer(Arc::new(ProviderSummarizer::new(
+                provider,
+                summary_model(&self.config),
+            )));
 
         let (sender, mut events) = mpsc::unbounded_channel();
         // Drain to a buffer rather than the renderer: a job's output must not
@@ -681,7 +821,10 @@ impl JobAgentRunner {
         let text = collected.await.unwrap_or_default();
 
         self.store
-            .append_messages(&session_id, &history[start..])
+            .append_messages(
+                &session_id,
+                &history[start.saturating_sub(outcome.compacted)..],
+            )
             .await?;
 
         let summary = format!(

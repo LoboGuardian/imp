@@ -69,6 +69,7 @@ use imp_tools::{
 
 use crate::cli::Cli;
 use crate::setup::{apply_history_window, cron_context, system_prompt, tool_config};
+use crate::summarize::ProviderSummarizer;
 
 /// Builds the provider for one conversation.
 ///
@@ -280,15 +281,24 @@ impl Runtime {
             parallel_tool_calls: Some(self.config.provider.parallel_tool_calls),
             include_usage: self.config.provider.supports_usage_in_stream,
             max_tool_calls_per_turn: self.config.agent.max_tool_calls_per_turn,
-            context_tokens: self.config.agent.context_tokens,
+            context_tokens: crate::setup::effective_budget(&self.config, None),
             tool_result_chars: self.config.agent.tool_result_chars,
+            compact: self.config.agent.compact,
+            compact_threshold: self.config.agent.compact_threshold,
+            compact_keep_turns: self.config.agent.compact_keep_turns,
+            summary_role: crate::setup::summary_role(&self.config),
             nudge_on_empty: self.config.agent.nudge_on_empty,
             repair_arguments: self.config.agent.repair_arguments,
             workspace_root: self.workspace_root.clone(),
         };
-        let agent = Agent::new((self.provider)(&session_id), tools, options)
+        let provider = (self.provider)(&session_id);
+        let agent = Agent::new(provider.clone(), tools, options)
             .with_gate(self.gate.clone())
-            .with_session(session_id.clone());
+            .with_session(session_id.clone())
+            .with_summarizer(Arc::new(ProviderSummarizer::new(
+                provider,
+                crate::setup::summary_model(&self.config),
+            )));
 
         let (sender, mut events) = mpsc::unbounded_channel();
         let collected = tokio::spawn(async move {
@@ -307,7 +317,10 @@ impl Runtime {
         let text = collected.await.unwrap_or_default();
 
         self.store
-            .append_messages(&session_id, &history[start..])
+            .append_messages(
+                &session_id,
+                &history[start.saturating_sub(outcome.compacted)..],
+            )
             .await?;
         if let Some(prompt) = history
             .iter()

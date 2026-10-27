@@ -40,6 +40,7 @@ rmcp = { version = "3.5.0", features = [
 # the hyper/tower crates the workspace already builds; `tokio` is the server
 # runtime adapter, and default features are off to keep the surface small.
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
+futures = "0.3.34"
 rustyline = "18.0.1"
 serde_json = "1.0.151"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "sync", "io-std", "io-util"] }
@@ -58,6 +59,5 @@ path = "src/main.rs"
 libc = "0.2.189"
 
 [dev-dependencies]
-futures = "0.3.34"
 insta = { version = "1.43.1", features = ["json"] }
 tempfile = "3.27.0"

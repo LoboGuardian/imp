@@ -69,7 +69,9 @@ pub async fn one_shot(
     let _ = rendering.await;
     watcher.abort();
 
-    session.persist_since(turn_start).await?;
+    session
+        .persist_since(turn_start.saturating_sub(outcome.compacted))
+        .await?;
 
     // Persist the turn's token usage against the session, so `/cost` and
     // `imp session` can aggregate it later without this process (§7). A

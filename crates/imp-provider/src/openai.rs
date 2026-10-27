@@ -218,6 +218,36 @@ impl OpenAiProvider {
         request
     }
 
+    /// The endpoint root, without a trailing slash.
+    pub(crate) fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// Fetch JSON from `url`, giving up after `timeout` and swallowing every
+    /// failure.
+    ///
+    /// Only the context probe uses this: discovery is opportunistic, and a
+    /// backend that does not answer must degrade to configuration rather than
+    /// fail a session.
+    pub(crate) async fn probe_json(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Option<serde_json::Value> {
+        let request = self.decorate(self.client.get(url));
+        let response = tokio::time::timeout(timeout, request.send())
+            .await
+            .ok()?
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        tokio::time::timeout(timeout, response.json())
+            .await
+            .ok()?
+            .ok()
+    }
+
     /// List the models the backend advertises, via `GET {base_url}/models`.
     ///
     /// Used by `imp init --check` and model discovery. Endpoints that do not

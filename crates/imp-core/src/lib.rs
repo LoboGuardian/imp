@@ -7,6 +7,7 @@ pub mod agent;
 pub mod args;
 pub mod classify;
 pub mod clock;
+pub mod compact;
 pub mod config;
 pub mod error;
 pub mod fs;
@@ -28,6 +29,7 @@ pub use agent::{Agent, AgentEvent, AgentOptions, StopReason, TurnOutcome, trim_t
 pub use args::{parse_tool_arguments, repair_json};
 pub use classify::classify_command;
 pub use clock::{Clock, ManualClock, SystemClock};
+pub use compact::{Plan, SUMMARY_MARKER, Summarizer, SummaryRole};
 pub use config::{
     Config, Credentials, CronConfig, GuardConfig, HttpFetchConfig, McpClientConfig, McpConfig,
     McpServerConfig, MissedRunPolicy, ProviderQuirks, ToolsConfig, UpdateConfig,

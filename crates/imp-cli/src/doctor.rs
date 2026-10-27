@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use imp_core::config::{Config, default_credentials_path, user_config_path};
+use imp_core::config::{Config, ContextProbe, default_credentials_path, user_config_path};
 use imp_core::error::{Error, Result};
 use imp_provider::OpenAiProvider;
 use imp_store::Store;
@@ -65,6 +65,8 @@ pub async fn run(cli: &Cli, config: &Config, cwd: &Path) -> Result<ExitCode> {
     let provider_check = provider_check(config).await;
     let provider_ok = provider_check.ok;
     checks.push(provider_check);
+
+    checks.push(context_check(config).await);
 
     let all_ok = checks.iter().all(|check| check.ok);
     report(cli, style::stdout_theme(cli, config), &checks);
@@ -204,6 +206,75 @@ async fn audit_summary(store: &Store) -> String {
             None => " · no decisions recorded".to_string(),
         },
         Err(_) => String::new(),
+    }
+}
+
+/// What the backend says about the model's context window and capabilities.
+///
+/// The OpenAI-compatible `/models` list says a model *exists*; it says nothing
+/// about whether it can be loaded or whether it can call tools. A local server
+/// is exactly where that distinction bites: a model that failed to load is
+/// still advertised, so the reachability check above passes while every turn
+/// fails with a 400. This check asks the one question the reachability check
+/// cannot.
+async fn context_check(config: &Config) -> Check {
+    let explicit = config.provider.context_window;
+    let info = match config.provider.context_probe {
+        ContextProbe::Off => None,
+        ContextProbe::Auto => {
+            let key = config.api_key().ok().flatten().unwrap_or_default();
+            let provider = OpenAiProvider::new(&config.provider.base_url, key)
+                .with_request_timeout(Some(PROBE_TIMEOUT))
+                .with_max_retries(1)
+                .with_headers(config.request_headers());
+            provider.probe_context(&config.provider.model).await
+        }
+    };
+
+    if info.as_ref().and_then(|info| info.tool_use) == Some(false) {
+        return Check::fail(
+            "context",
+            format!(
+                "{} does not advertise tool calling; every tool call will be refused",
+                config.provider.model
+            ),
+        );
+    }
+
+    let budget = crate::setup::effective_budget(config, info.as_ref());
+    match (explicit, info) {
+        (Some(window), _) => Check::ok(
+            "context",
+            format!("{window} configured · budget {}", describe_budget(budget)),
+        ),
+        (None, Some(info)) => {
+            let window = match (info.context_window, info.max_context) {
+                (Some(window), _) => format!("{window} window"),
+                (None, Some(max)) => format!("{max} max"),
+                (None, None) => "window unknown".to_string(),
+            };
+            let note = match info.context_window {
+                Some(_) => format!(" · budget {}", describe_budget(budget)),
+                // Nothing is loaded, so there is no runtime window to measure;
+                // this is the state that produces a load error on first use.
+                None => {
+                    " · loads on the first request, which can fail for want of memory".to_string()
+                }
+            };
+            Check::ok("context", format!("{} · {window}{note}", info.describe()))
+        }
+        (None, None) => Check::ok(
+            "context",
+            "not discovered — set provider.context_window or agent.context_tokens",
+        ),
+    }
+}
+
+/// Render a budget, or say that there is none.
+fn describe_budget(budget: Option<usize>) -> String {
+    match budget {
+        Some(tokens) => tokens.to_string(),
+        None => "none (no trimming)".to_string(),
     }
 }
 

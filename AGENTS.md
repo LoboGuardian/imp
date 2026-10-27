@@ -85,6 +85,14 @@ the budget/cap/nudge paths in `imp-core/src/agent.rs`, and the wire changes in
 `imp-provider/src/openai.rs` (`stream_idle_timeout_secs`, `extra_body`, quirks, non-streaming).
 See the D45 bullets in "Small-model loop rules" before changing any of it.
 
+**D49/D50 are on branch `feat/context-window-compaction`**, cut from `main` after v0.1.3. The context
+window is discovered from the endpoint where the backend publishes it (`imp-provider/src/context.rs`:
+vLLM `/models`, LM Studio `/api/v0/models`, llama.cpp `/props`, Ollama `/api/ps`), `doctor` and the new
+`/context` command report it, and a history that nears its budget is compacted into one `[summary]`
+message instead of being dropped (`imp-core/src/compact.rs` for the pure rule set, `agent.rs`'s
+`compact_if_needed` for the trigger, `imp-cli/src/summarize.rs` for the request that writes it). See
+"Context and compaction rules" below before touching any of it.
+
 ## Commands
 
 ```sh
@@ -540,6 +548,56 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   plus a `.sha256`. The Linux musl targets need a musl C compiler — see `NFR.md` for the no-root
   recipe used on this host.
 
+## Context and compaction rules (D49/D50)
+
+The window and the summary are two halves of one problem: a context that is too small is only
+survivable if imp knows how small it is, and history that no longer fits is only usable if it is
+summarized rather than dropped. Traps that cost time:
+
+- **An explicit `provider.context_window` skips the probe entirely.** Precedence is config, then the
+  endpoint, then nothing. `imp-provider::context` asks `/models` (vLLM), `/api/v0/models` (LM Studio),
+  `/props` (llama.cpp) and `/api/ps` (Ollama), and the last three only for a **loopback** base URL —
+  the origin-level endpoints are local-server conveniences, and a hosted gateway should never see a
+  `/props`. Every probe is bounded to two seconds and swallows its failures: discovery degrades to
+  configuration, it never fails a session.
+- **Discovery turns budgeting on, and reserves generation room.** With `agent.context_tokens` unset,
+  `setup::effective_budget` derives `window - max(max_tokens, 512) - 5%`. The generation part is not
+  padding: a reasoning model spends its window *producing* the answer, so reserving only for the
+  prompt leaves a mid-generation overflow that looks like an empty reply. Do not "simplify" the
+  reserve to a fixed margin.
+- **Compaction is triggered by `compact_threshold`, not by the hard limit, and the trigger is
+  authoritative.** `Agent::compact_if_needed` runs `compact::plan_forced` once the threshold is
+  crossed; using `plan` there would re-test the budget and never fire, because the threshold sits
+  below it. `plan` is for `/compact`-style "does it fit" callers only.
+- **A summary is never allowed to cost more than what it replaces.** Two guards: `MIN_COMPACT_TOKENS`
+  avoids the guaranteed-losing trade of summarizing a few short messages, and the post-check discards
+  any summary whose estimate is not smaller than the replaced range. Without the second one,
+  compaction can grow the context — verified live: 187 → 224 tokens with `keep_turns = 1`.
+- **`trim_to_budget` protects the summary.** A summary sits at index 1, exactly where trimming starts
+  dropping, so `trim_to_budget` treats a summary at index 1 as fixed and drains from index 2. Reversed,
+  the first trim after a compaction throws away the only record of everything already dropped.
+- **Compaction shifts indices, and every caller has to know.** `TurnOutcome.compacted` is the net
+  number of messages removed. Three places persist from an index captured before the turn —
+  `repl.rs`'s `reply_start`, `run.rs`'s `turn_start`, and the `start` in the cron and MCP-server
+  runners — and each subtracts it. Forgetting one writes the turn twice or drops it. The unit test
+  asserts the contract as `history.len() == before + 1 - compacted`.
+- **The stored transcript is never rewritten (R3).** Compaction replaces messages in the in-memory
+  history only; SQLite keeps every row, so a resume re-derives the state instead of trusting a
+  rewritten log. That is why `messages.is_summary` has no writer: persisting a summary in position
+  would need a way to mark the rows it supersedes, and an append-only log cannot express that without
+  a schema change.
+- **The summary role is a provider quirk, not a decision the loop makes.** Default `system` with a
+  `[summary]` marker; `[provider.quirks].summary_as_user` exists for chat templates that accept one
+  system message at the start. The role is chosen where the message is built, so flipping the quirk
+  never needs a migration.
+- **Compaction runs at the turn boundary because local backends serialize requests.** LM Studio and
+  `llama-server` serve one request at a time, so a "background" summarization fired mid-turn queues
+  behind the live generation and doubles its latency. Boundary compaction gets the same benefit —
+  the user is reading, not waiting — with no concurrency to get wrong.
+- **A failed summary is a notice, never a failed turn.** The loop falls back to `trim_to_budget`, which
+  is exactly the pre-compaction behaviour. `imp-core` does the same with no summarizer installed, so
+  the loop's contract does not mention compaction at all.
+
 ## Terminal presentation rules (D47)
 
 - **Every escape and every glyph comes from `imp-cli/src/style.rs`.** The palette is 16-colour SGR (`style::code`), the glyph table is `style::glyph`, and the runtime decision is `Theme`. `NO_COLOR`, `--no-color`, `[ui].color` and `--json` are resolved in one function (`style::colour`); a new sink that writes its own escape has opted out of all four. Keep `--json` a hard no.
@@ -691,8 +749,14 @@ tool-result cap, argument repair, one bounded nudge and provider wire compatibil
   desynchronising, so no test drives a real keypress end to end. Treat it as unverified.
 - Tool calls execute **sequentially**; bounded concurrency is tracked as `FR-8` in `agent.rs`.
 - `usage` is advisory and may be zero; no turn is blocked on it.
-- History trimming / summarization (`history_window`, `summarize_on_truncate`) is applied when a
-  transcript is reloaded, but summarization is not implemented.
+- History trimming (`history_window`) is applied when a transcript is reloaded; compaction is not, and
+  a resumed session compacts again on its first turn. Compaction is a view over history, never a
+  rewrite of the stored transcript, so resuming costs one summarization request rather than risking a
+  corrupted log.
+- **A single oversized turn cannot be compacted**, only dropped or capped: keeping the newest turn
+  verbatim is what keeps a summary from replacing the conversation the model is in the middle of.
+  `agent.tool_result_chars` is the control that bounds one huge tool result; compaction handles the
+  history around it.
 - The provider is only smoke-tested against a stub server. There is no recorded provider fixture
   suite yet (SDD §8).
 - **The markdown renderer is verified by unit tests and one manual pty pass, not fixtures.** Column
