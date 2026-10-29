@@ -41,6 +41,38 @@ const PROJECT_CONFIG: &str = "imp.toml";
 /// project's settings is the failure the fallback exists to avoid (SDD D46).
 const LEGACY_PROJECT_CONFIG: &str = "minion.toml";
 
+/// Config fields that are considered dangerous when loaded from an untrusted
+/// project directory, because they enable code execution or secret exfiltration.
+const DANGEROUS_CONFIG_FIELDS: &[&str] = &[
+    "mcp.client.servers",
+    "peers",
+    "provider.api_key_file",
+    "provider.api_key_env",
+    "provider.base_url",
+    "provider.token_file",
+    "mcp.server.token_file",
+    "mcp.server.token_env",
+    "agent.system_prompt_file",
+];
+
+/// Check whether the config was loaded from a project directory and warn about
+/// dangerous fields that could enable code execution or secret exfiltration.
+fn warn_about_project_config(path: &Path) {
+    // Only warn if loading from an actual project file (not the default path)
+    if !path.exists() {
+        return;
+    }
+    eprintln!(
+        "imp: WARNING: loading configuration from {}",
+        path.display()
+    );
+    eprintln!("imp: This file may contain fields that execute code or access secrets.");
+    eprintln!("imp: Review the file before trusting it, especially:");
+    for field in DANGEROUS_CONFIG_FIELDS {
+        eprintln!("imp:   - [{}]", field);
+    }
+}
+
 /// Request-body keys `[provider.extra_body]` may not override.
 ///
 /// These are built by the agent loop or the provider client; letting a config
@@ -1519,6 +1551,7 @@ pub fn default_credentials_path() -> Option<PathBuf> {
 fn project_config_path(cwd: &Path) -> PathBuf {
     let current = cwd.join(PROJECT_CONFIG);
     if current.exists() {
+        warn_about_project_config(&current);
         return current;
     }
     let legacy = cwd.join(LEGACY_PROJECT_CONFIG);
@@ -1528,6 +1561,7 @@ fn project_config_path(cwd: &Path) -> PathBuf {
             legacy.display(),
             current.display()
         );
+        warn_about_project_config(&legacy);
         return legacy;
     }
     current
