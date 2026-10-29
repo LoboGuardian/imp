@@ -124,6 +124,14 @@ impl Tool for RunCommand {
             .arg("-c")
             .arg(&args.command)
             .current_dir(&directory)
+            // Clear the environment to prevent API keys and other secrets
+            // from being leaked to child processes. Only PATH, HOME, USER,
+            // and a few safe variables are preserved.
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", std::env::var("HOME").unwrap_or_default())
+            .env("USER", std::env::var("USER").unwrap_or_default())
+            .env("TERM", std::env::var("TERM").unwrap_or_default())
             .stdin(if args.stdin.is_some() {
                 Stdio::piped()
             } else {
