@@ -155,10 +155,62 @@ pub fn subject_for(tool: &str, args: &Value) -> String {
     }
     for field in ["path", "file"] {
         if let Some(value) = args.get(field).and_then(Value::as_str) {
-            return value.to_string();
+            // Normalize the path to prevent bypasses like ./../secrets or src/../etc
+            return normalize_path(value);
         }
     }
     tool.to_string()
+}
+
+/// Normalize a path by resolving `..` and redundant slashes.
+///
+/// This prevents deny-rule bypasses like:
+/// - `./.env` evading a rule for `.env`
+/// - `src/../secrets.env` evading a rule for `src/*`
+fn normalize_path(path: &str) -> String {
+    let mut result = String::new();
+    let mut segments: Vec<&str> = Vec::new();
+
+    for segment in path.split('/') {
+        match segment {
+            "" | "." => continue, // Skip empty or current directory
+            ".." => {
+                // Go up one level, but don't go below the root
+                if !segments.is_empty() {
+                    segments.pop();
+                }
+            }
+            _ => segments.push(segment),
+        }
+    }
+
+    // Reconstruct the path
+    for (i, seg) in segments.iter().enumerate() {
+        if i > 0 {
+            result.push('/');
+        }
+        result.push_str(seg);
+    }
+
+    // If path started with /, preserve it
+    if path.starts_with('/') && !result.is_empty() {
+        result.insert(0, '/');
+    }
+
+    // If the result is empty but original wasn't, return the original
+    // (this handles cases like "." or "./")
+    if result.is_empty() && !path.is_empty() && !path.contains("..") {
+        // Handle the case where we resolved everything away
+        if let Some(last) = segments.last() {
+            return last.to_string();
+        }
+    }
+
+    if result.is_empty() {
+        path.to_string()
+    } else {
+        result
+    }
 }
 
 /// A gate that records every decision it delegates.
