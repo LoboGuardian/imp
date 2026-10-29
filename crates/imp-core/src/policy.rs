@@ -570,6 +570,18 @@ impl ToolGate for PolicyEngine {
             return Ok(());
         }
         if !self.interactive {
+            // The classifier outranks the non-interactive fallback: a flagged
+            // command must never run, even with --yes, because a prompt is
+            // impossible and the fallback cannot substitute consent the user
+            // cannot give. This is the same logic as step 5, but applied before
+            // the early return so dangerous commands are refused in pipelines.
+            if !flags.is_empty() {
+                return Err(Error::Denied(format!(
+                    "`{tool}` was flagged as {} and cannot run in non-interactive mode: {subject}. \
+                     Run interactively or allowlist it under [policy.allow].",
+                    flags.join(", ")
+                )));
+            }
             // A family policy substitutes the global non-interactive decision
             // for its own tools (D21), which is how a trusted local server can
             // run a turn unattended while everything else still fails closed.
