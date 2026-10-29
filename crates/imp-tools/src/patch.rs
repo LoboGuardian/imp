@@ -235,10 +235,30 @@ async fn read_capped(path: &std::path::Path, max_bytes: u64, tool: &'static str)
 }
 
 /// Write `contents` atomically, so a crash cannot truncate the target.
-pub async fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> {
+///
+/// The temp file is created in the workspace root to prevent symlink attacks:
+/// if `path` points outside the workspace via a symlink, creating the temp
+/// alongside it would also be outside the workspace. By creating the temp in
+/// the workspace root and then atomically moving it to the target, we ensure
+/// the operation stays within bounds.
+pub async fn write_atomic(
+    path: &std::path::Path,
+    contents: &str,
+    workspace_root: &std::path::Path,
+) -> Result<()> {
     use tokio::io::AsyncWriteExt;
 
-    let temp = path.with_extension("imp-tmp");
+    // Create temp in workspace root, not alongside target, to prevent
+    // symlink attacks where target points outside workspace.
+    let temp_filename = format!(
+        ".imp-tmp-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let temp = workspace_root.join(temp_filename);
+
     {
         let mut file = tokio::fs::File::create(&temp).await.map_err(Error::Io)?;
         file.write_all(contents.as_bytes())
@@ -247,6 +267,37 @@ pub async fn write_atomic(path: &std::path::Path, contents: &str) -> Result<()> 
         file.flush().await.map_err(Error::Io)?;
         let _ = file.sync_all().await;
     }
+
+    // Before renaming, verify the target is still within workspace.
+    // This catches the case where a symlink was changed between the
+    // initial resolve and now.
+    let target_canonical = tokio::fs::canonicalize(path).await;
+    let target_within_workspace = match target_canonical {
+        Ok(canon) => canon.starts_with(workspace_root),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Target doesn't exist yet - check parent directory
+            if let Some(parent) = path.parent() {
+                // If parent is within workspace, or is the workspace itself, allow
+                parent.starts_with(workspace_root) || parent == workspace_root
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    };
+
+    if !target_within_workspace {
+        // Clean up temp file and deny the write
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(Error::Tool {
+            tool: "write".to_string(),
+            message: format!(
+                "target `{}` is outside the workspace",
+                path.display()
+            ),
+        });
+    }
+
     tokio::fs::rename(&temp, path)
         .await
         .map_err(|err| Error::Tool {
@@ -342,7 +393,7 @@ impl Tool for EditFile {
             });
         }
 
-        write_atomic(&path, &after).await?;
+        write_atomic(&path, &after, &ctx.workspace_root).await?;
 
         let diff = unified_diff(&args.path, &before, &after);
         Ok(ToolOutput {
@@ -563,7 +614,7 @@ impl Tool for ApplyPatch {
         }
 
         for (_, resolved, _, after, _) in &prepared {
-            write_atomic(resolved, after).await?;
+            write_atomic(resolved, after, &ctx.workspace_root).await?;
         }
 
         let files: Vec<&str> = prepared.iter().map(|(path, ..)| path.as_str()).collect();

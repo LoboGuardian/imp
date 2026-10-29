@@ -124,7 +124,7 @@ impl Tool for WriteFile {
             });
         }
 
-        write_atomic(&path, &args.content).await?;
+        write_atomic(&path, &args.content, &ctx.workspace_root).await?;
 
         Ok(
             ToolOutput::text(format!("wrote {} ({content_bytes} bytes)", args.path))
